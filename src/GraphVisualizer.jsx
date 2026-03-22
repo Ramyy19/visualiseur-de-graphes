@@ -2408,12 +2408,11 @@ const hintText = primPickMode
     style={{
       ...btn(false, true),
       // On force les couleurs vives pour les deux modes
-      background: "#1a1a1b", 
-      borderColor: "#f59e0b", 
-      color: "#fcd34d",
-      fontWeight: "600",
-      // On ajoute un petit effet d'ombre pour le faire ressortir sur le beige
-      boxShadow: "0 2px 4px rgba(239, 68, 68, 0.2)"
+      background: "#3c1d71", 
+      borderColor: "#2b1155", 
+      color: "#ffffff",
+      boxShadow: "0 2px 4px rgba(124, 58, 237, 0.3)",
+      fontWeight: "600"
     }} 
     onClick={clearSequence}
   >
