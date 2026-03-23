@@ -789,7 +789,6 @@ function computeDijkstraSteps(elements, startId) {
   const idToLabel = {};
   nodes.forEach(n => { idToLabel[n.data.id] = n.data.label; });
   const ids = nodes.map(n => n.data.id);
-
   const adj = {};
   ids.forEach(id => { adj[id] = []; });
   edges.forEach(e => {
@@ -798,153 +797,155 @@ function computeDijkstraSteps(elements, startId) {
   });
 
   const lambda = {};
-  const predEdge = {}; // predEdge[nodeId] = edgeId of the best known arc to nodeId
+  const predEdge = {};
   ids.forEach(id => { lambda[id] = id === startId ? 0 : Infinity; predEdge[id] = null; });
 
-  const S = new Set(); // selected nodes
+  const S = new Set();
   const committedRows = [];
   const steps = [];
 
-  committedRows.push({ selectedId: '__init__', lambdaSnap: { ...lambda }, S: new Set(S) });
+  // committed rows accumulate — each step shows all rows up to current
+  const snapRows = () => committedRows.map(r => ({ ...r, lambdaSnap: { ...r.lambdaSnap }, S: new Set(r.S) }));
 
-  // Each step carries explicit cy instructions:
-  //   cyNodes: { id -> 'source'|'selected'|'pending'|'path'|null }
-  //   cyEdges: { eid -> 'tree'|'highlight'|'path'|null }
-  const makeCyState = (overrides = {}) => {
-    const cyNodes = {};
-    const cyEdges = {};
-    // Default: source = source, S members = selected, predEdge arcs = tree
+  // cy state: explicit node/edge classes
+  const makeCy = (extra = {}) => {
+    const cyN = {}, cyE = {};
     ids.forEach(id => {
-      if (id === startId) cyNodes[id] = 'source';
-      else if (S.has(id)) cyNodes[id] = 'selected';
-      else cyNodes[id] = null;
+      if (id === startId) cyN[id] = 'source';
+      else if (S.has(id)) cyN[id] = 'selected';
+      else cyN[id] = null;
     });
-    Object.entries(predEdge).forEach(([, eid]) => {
-      if (eid) cyEdges[eid] = 'tree';
-    });
-    // Apply overrides
-    Object.assign(cyNodes, overrides.cyNodes || {});
-    Object.assign(cyEdges, overrides.cyEdges || {});
-    return { cyNodes, cyEdges };
+    Object.values(predEdge).forEach(eid => { if (eid) cyE[eid] = 'tree'; });
+    Object.assign(cyN, extra.cyN || {});
+    Object.assign(cyE, extra.cyE || {});
+    return { cyN, cyE };
   };
 
-  // Step 0: init
+  // Init step
+  committedRows.push({ selectedId: '__init__', lambdaSnap: { ...lambda }, S: new Set() });
   steps.push({
-    committedRows: committedRows.map(r => ({ ...r, lambdaSnap: { ...r.lambdaSnap }, S: new Set(r.S) })),
-    pendingRow: null, S: new Set(S), lambda: { ...lambda }, done: false,
-    phase: 'init',
-    cy: makeCyState(),
-    message: 'Initialisation : λ(source) = 0, λ(autres) = ∞',
+    rows: snapRows(), pendingRow: null, S: new Set(S), done: false, phase: 'init',
+    cy: makeCy(),
+    hint: `Je regarde λ(${idToLabel[startId]}) = 0. Toutes les autres distances = ∞. Je vais sélectionner le sommet avec la plus petite distance hors de S.`,
+    message: `Initialisation : λ(${idToLabel[startId]}) = 0, λ(autres) = ∞.`,
   });
 
   while (S.size < ids.length) {
     let minVal = Infinity, chosen = null;
     ids.forEach(id => { if (!S.has(id) && lambda[id] < minVal) { minVal = lambda[id]; chosen = id; } });
-    if (chosen === null || minVal === Infinity) break;
+    if (!chosen || minVal === Infinity) break;
 
-    // ── STEP A : i sélectionné (orange) ──────────────────────────────────
+    const lbl = idToLabel[chosen];
+
+    // ── Step A: sommet sélectionné (orange), tableau vide pour cette ligne ──
     const cellsA = {};
     ids.forEach(id => {
       cellsA[id] = (S.has(id) || id === chosen)
-        ? { slash: true }
-        : { slash: false, formula: null, value: lambda[id] };
+        ? { slash: true } : { slash: false, value: lambda[id] };
     });
-
     steps.push({
-      committedRows: committedRows.map(r => ({ ...r, lambdaSnap: { ...r.lambdaSnap }, S: new Set(r.S) })),
-      pendingRow: { selectedId: chosen, cells: cellsA, phase: 'selected' },
-      S: new Set(S), lambda: { ...lambda }, done: false,
-      phase: 'selected',
-      cy: makeCyState({ cyNodes: { [chosen]: 'pending' } }),
-      message: `① Sélection de ${idToLabel[chosen]} (λ = ${minVal}) — on examine ses successeurs.`,
+      rows: snapRows(), pendingRow: { selectedId: chosen, cells: cellsA },
+      S: new Set(S), done: false, phase: 'select',
+      cy: makeCy({ cyN: { [chosen]: 'pending' } }),
+      hint: `Je regarde la dernière ligne du tableau. Le minimum des valeurs hors S est λ(${lbl}) = ${minVal}. Je sélectionne ${lbl} et je l'ajoute à S.`,
+      message: `Sélection de ${lbl} — λ = ${minVal}, plus petite distance connue hors S.`,
     });
 
-    // ── STEP B : Formules calculées, arc amélioré surligné ────────────────
-    // Compute which arcs improve lambda
-    const improvingArcs = []; // { to, w, eid } where lambda[chosen]+w < lambda[to]
-    const formulaMap = {};
+    // ── Step B: formules calculées, arcs améliorés surlignés ──
+    // Compute improving arcs BEFORE updating lambda
+    const improving = [];
     adj[chosen].forEach(({ to, w, eid }) => {
-      if (!S.has(to)) {
-        const nd = lambda[chosen] + w;
-        const lStr = String(minVal);
-        formulaMap[to] = { formula: `${lStr}+${w}`, newVal: nd };
-        if (nd < lambda[to]) improvingArcs.push({ to, w, eid });
-      }
+      if (!S.has(to) && lambda[chosen] + w < lambda[to])
+        improving.push({ to, eid, formula: `${minVal}+${w}`, newVal: lambda[chosen] + w });
     });
 
-    // nextMin after potential updates
-    const tempLambda = { ...lambda };
-    improvingArcs.forEach(({ to, w }) => { if (lambda[chosen] + w < tempLambda[to]) tempLambda[to] = lambda[chosen] + w; });
+    // tempLambda to find next min
+    const tempL = { ...lambda };
+    improving.forEach(({ to, newVal }) => { if (newVal < tempL[to]) tempL[to] = newVal; });
     let nextMin = Infinity;
-    ids.forEach(id => { if (!S.has(id) && id !== chosen && tempLambda[id] < nextMin) nextMin = tempLambda[id]; });
+    ids.forEach(id => { if (!S.has(id) && id !== chosen && tempL[id] < nextMin) nextMin = tempL[id]; });
 
     const cellsB = {};
     ids.forEach(id => {
-      if (S.has(id) || id === chosen) {
-        cellsB[id] = { slash: true };
-      } else if (formulaMap[id]) {
-        cellsB[id] = { slash: false, formula: formulaMap[id].formula, value: formulaMap[id].newVal, isMin: tempLambda[id] === nextMin };
-      } else {
-        cellsB[id] = { slash: false, formula: null, value: lambda[id], isMin: tempLambda[id] === nextMin };
-      }
+      if (S.has(id) || id === chosen) { cellsB[id] = { slash: true }; return; }
+      const imp = improving.find(x => x.to === id);
+      cellsB[id] = imp
+        ? { formula: imp.formula, value: imp.newVal, isMin: tempL[id] === nextMin }
+        : { value: lambda[id], isMin: tempL[id] === nextMin };
     });
 
-    // cyEdges: improving arcs highlighted, existing tree stays
-    const cyEdgesB = {};
-    Object.entries(predEdge).forEach(([, eid]) => { if (eid) cyEdgesB[eid] = 'tree'; });
-    improvingArcs.forEach(({ eid }) => { cyEdgesB[eid] = 'highlight'; });
+    const cyEB = {};
+    Object.values(predEdge).forEach(eid => { if (eid) cyEB[eid] = 'tree'; });
+    improving.forEach(({ eid }) => { cyEB[eid] = 'highlight'; });
 
+    const impLabels = improving.map(x => `λ(${idToLabel[x.to]}) = ${x.formula} = ${x.newVal}`).join(' ; ');
     steps.push({
-      committedRows: committedRows.map(r => ({ ...r, lambdaSnap: { ...r.lambdaSnap }, S: new Set(r.S) })),
-      pendingRow: { selectedId: chosen, cells: cellsB, phase: 'formulas' },
-      S: new Set(S), lambda: { ...lambda }, done: false,
-      phase: 'formulas',
-      cy: { cyNodes: makeCyState({ cyNodes: { [chosen]: 'pending' } }).cyNodes, cyEdges: cyEdgesB },
-      message: `② Calcul des distances via ${idToLabel[chosen]}. Arc(s) amélioré(s) surligné(s).`,
+      rows: snapRows(), pendingRow: { selectedId: chosen, cells: cellsB },
+      S: new Set(S), done: false, phase: 'formulas',
+      cy: { cyN: makeCy({ cyN: { [chosen]: 'pending' } }).cyN, cyE: cyEB },
+      hint: improving.length > 0
+        ? `Je calcule λ(${lbl}) + l(${lbl}, voisin) pour chaque voisin de ${lbl}. Si c'est plus petit que la valeur actuelle, je mets à jour. Arc(s) amélioré(s) : ${impLabels}.`
+        : `Aucun voisin de ${lbl} ne peut être amélioré via ${lbl}. Rien à mettre à jour.`,
+      message: improving.length > 0
+        ? `Mise à jour via ${lbl} : ${impLabels}.`
+        : `Aucune mise à jour depuis ${lbl}.`,
     });
 
-    // ── STEP C : Validation — i intègre S ────────────────────────────────
+    // Commit
     S.add(chosen);
-    const committedEdges = []; // newly set predEdge arcs
-    adj[chosen].forEach(({ to, w, eid }) => {
-      if (!S.has(to)) {
-        const nd = lambda[chosen] + w;
-        if (nd < lambda[to]) { lambda[to] = nd; predEdge[to] = eid; committedEdges.push(eid); }
-      }
-    });
-
+    improving.forEach(({ to, eid, newVal }) => { lambda[to] = newVal; predEdge[to] = eid; });
     committedRows.push({ selectedId: chosen, lambdaSnap: { ...lambda }, S: new Set(S) });
     const isDone = S.size === ids.length || ids.every(id => S.has(id) || lambda[id] === Infinity);
 
-    // cyEdges: only the newly committed arcs highlighted
-    const cyEdgesC = {};
-    committedEdges.forEach(eid => { cyEdgesC[eid] = 'highlight'; });
-
-    steps.push({
-      committedRows: committedRows.map(r => ({ ...r, lambdaSnap: { ...r.lambdaSnap }, S: new Set(r.S) })),
-      pendingRow: null,
-      S: new Set(S), lambda: { ...lambda }, done: isDone,
-      phase: isDone ? 'done' : 'committed',
-      cy: isDone
-        ? (() => {
-            const cyNodesD = {};
-            const cyEdgesD = {};
-            ids.forEach(id => { cyNodesD[id] = id === startId ? 'source' : S.has(id) ? 'path' : null; });
-            Object.entries(predEdge).forEach(([, eid]) => { if (eid) cyEdgesD[eid] = 'path'; });
-            return { cyNodes: cyNodesD, cyEdges: cyEdgesD };
-          })()
-        : { cyNodes: makeCyState().cyNodes, cyEdges: cyEdgesC },
-      message: isDone
-        ? `✓ Dijkstra terminé — toutes les distances optimales depuis ${idToLabel[startId]}.`
-        : `③ ${idToLabel[chosen]} intègre S. Arc(s) mis à jour surligné(s).`,
-    });
-
+    if (isDone) {
+      // Final step: show full arborescence in gold
+      const cyNF = {}, cyEF = {};
+      ids.forEach(id => {
+        if (id === startId) cyNF[id] = 'source';
+        else if (S.has(id)) cyNF[id] = 'path';
+        else cyNF[id] = null;
+      });
+      Object.values(predEdge).forEach(eid => { if (eid) cyEF[eid] = 'path'; });
+      steps.push({
+        rows: snapRows(), pendingRow: null, S: new Set(S), done: true, phase: 'done',
+        cy: { cyN: cyNF, cyE: cyEF },
+        hint: `λ = λ précédente → STOP. Les valeurs encadrées sont les distances les plus courtes définitives depuis ${idToLabel[startId]} vers chaque sommet. Les arcs dorés forment l'arborescence des plus courts chemins.`,
+        message: `Dijkstra terminé — distances optimales depuis ${idToLabel[startId]}.`,
+      });
+    } else {
+      // Committed step: only newly updated arcs highlighted
+      const cyEC = {};
+      improving.forEach(({ eid }) => { if (eid) cyEC[eid] = 'highlight'; });
+      steps.push({
+        rows: snapRows(), pendingRow: null, S: new Set(S), done: false, phase: 'committed',
+        cy: { cyN: makeCy().cyN, cyE: cyEC },
+        hint: `${lbl} est maintenant dans S. Je mets à jour les distances (arcs surlignés). Je cherche maintenant le nouveau minimum parmi les sommets hors S.`,
+        message: `${lbl} intègre S. Distances mises à jour.`,
+      });
+    }
     if (isDone) break;
   }
 
   return { steps, ids, idToLabel };
 }
 
+// ─── Hint box ────────────────────────────────────────────────────────────────
+function HintBox({ text, phase, darkMode }) {
+  const colors = {
+    init:      { bg: darkMode ? "rgba(59,130,246,0.12)"  : "rgba(59,130,246,0.08)",  border: "#3b82f6", icon: "💡" },
+    select:    { bg: darkMode ? "rgba(245,158,11,0.12)"  : "rgba(245,158,11,0.08)",  border: "#f59e0b", icon: "①" },
+    formulas:  { bg: darkMode ? "rgba(59,130,246,0.12)"  : "rgba(59,130,246,0.08)",  border: "#3b82f6", icon: "②" },
+    committed: { bg: darkMode ? "rgba(16,185,129,0.12)"  : "rgba(16,185,129,0.08)",  border: "#10b981", icon: "③" },
+    done:      { bg: darkMode ? "rgba(245,158,11,0.15)"  : "rgba(245,158,11,0.1)",   border: "#f59e0b", icon: "✓" },
+  };
+  const c = colors[phase] || colors.init;
+  return (
+    <div style={{ margin: "8px 12px", padding: "10px 14px", borderRadius: "10px", background: c.bg, border: `1px solid ${c.border}40`, display: "flex", gap: "10px", alignItems: "flex-start" }}>
+      <span style={{ fontSize: "16px", flexShrink: 0, lineHeight: 1.4 }}>{c.icon}</span>
+      <span style={{ fontSize: "12px", color: darkMode ? "#e2e8f0" : "#1e293b", fontFamily: "Inter, sans-serif", lineHeight: "1.6" }}>{text}</span>
+    </div>
+  );
+}
 
 function DijkstraPanel({ elements, startNodeId, onClose, onHide, darkMode, onStep }) {
   const frozenElements = useMemo(() => elements, []);
@@ -967,68 +968,54 @@ function DijkstraPanel({ elements, startNodeId, onClose, onHide, darkMode, onSte
 
   if (steps.length === 0) return (
     <div style={{ position: "fixed", bottom: "20px", left: "50%", transform: "translateX(-50%)", zIndex: 200, background: bg, border: `1px solid ${borderC}`, borderRadius: "14px", padding: "18px 24px", maxWidth: "420px", textAlign: "center" }}>
-      <div style={{ color: textMain, fontWeight: "600", marginBottom: "6px", fontFamily: "Inter, sans-serif" }}>Impossible de lancer Dijkstra</div>
-      <div style={{ color: textMuted, fontSize: "12px", marginBottom: "16px" }}>Le graphe doit être orienté pondéré avec un sommet source.</div>
-      <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-              <button onClick={onHide} title="Masquer le panneau" style={{ background: "transparent", border: `1px solid ${borderC}`, borderRadius: "6px", color: textMuted, cursor: "pointer", fontSize: "13px", padding: "3px 8px", lineHeight: 1 }}>👁</button>
-              <button onClick={onClose} style={{ padding: "7px 20px", background: "#3b82f6", border: "none", borderRadius: "8px", color: "#fff", cursor: "pointer" }}>Fermer</button>
-            </div>
+      <div style={{ color: textMain, fontWeight: "600", marginBottom: "6px" }}>Impossible de lancer Dijkstra</div>
+      <div style={{ color: textMuted, fontSize: "12px", marginBottom: "16px" }}>Graphe orienté pondéré requis.</div>
+      <button onClick={onClose} style={{ padding: "7px 20px", background: "#3b82f6", border: "none", borderRadius: "8px", color: "#fff", cursor: "pointer" }}>Fermer</button>
     </div>
   );
 
   const step = steps[idx];
   const done = step.done;
-  const { committedRows, pendingRow } = step;
-
-  // Column widths: we need a fixed width for the label column
+  const { rows, pendingRow } = step;
   const labelColW = "148px";
-  const dataColW = "68px";
+  const dataColW = "64px";
+
+  // Gold circles: for each column, find last row where value is not slashed
+  const definitiveRowIdx = {};
+  if (done) {
+    ids.forEach(id => {
+      for (let r = rows.length - 1; r >= 0; r--) {
+        const row = rows[r];
+        if (!(row.selectedId !== '__init__' && row.S.has(id))) { definitiveRowIdx[id] = r; break; }
+      }
+    });
+  }
 
   return (
-    <div style={{ position: "fixed", bottom: "16px", left: "50%", transform: "translateX(-50%)", zIndex: 200, background: bg, border: `1px solid ${borderC}`, borderRadius: "16px", width: "min(900px, 96vw)", maxHeight: "82vh", overflowY: "auto", boxShadow: "0 8px 40px rgba(0,0,0,0.5)", backdropFilter: "blur(12px)" }}>
+    <div style={{ position: "fixed", bottom: "16px", left: "50%", transform: "translateX(-50%)", zIndex: 200, background: bg, border: `1px solid ${borderC}`, borderRadius: "16px", width: "min(940px, 96vw)", maxHeight: "84vh", overflowY: "auto", boxShadow: "0 8px 40px rgba(0,0,0,0.5)", backdropFilter: "blur(12px)", display: "flex", flexDirection: "column" }}>
 
-      <div style={{ height: "3px", background: thBorder, borderRadius: "16px 16px 0 0", overflow: "hidden" }}>
+      {/* Progress bar */}
+      <div style={{ height: "3px", background: thBorder, borderRadius: "16px 16px 0 0", overflow: "hidden", flexShrink: 0 }}>
         <div style={{ height: "100%", width: (steps.length > 1 ? idx / (steps.length - 1) * 100 : 0) + "%", background: done ? "#10b981" : "#3b82f6", transition: "width 0.3s" }} />
       </div>
 
-      <div style={{ padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${borderC}` }}>
+      {/* Header */}
+      <div style={{ padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${borderC}`, flexShrink: 0 }}>
         <span style={{ fontWeight: "700", fontSize: "13px", color: textMain, fontFamily: "Inter, sans-serif" }}>
-          Dijkstra — Étape {idx + 1}/{steps.length}
-          {step.S.size > 0 && <span style={{ color: "#3b82f6", marginLeft: "10px", fontSize: "11px", fontWeight: "500" }}>S = {"{" + [...step.S].map(id => idToLabel[id]).join(", ") + "}"}</span>}
+          Dijkstra — {idx + 1}/{steps.length}
+          {step.S.size > 0 && <span style={{ color: "#3b82f6", marginLeft: "8px", fontSize: "11px" }}>S = {"{" + [...step.S].map(id => idToLabel[id]).join(", ") + "}"}</span>}
         </span>
-              <button onClick={onHide} title="Masquer" style={{ background: "transparent", border: `1px solid ${borderC}`, borderRadius: "6px", color: textMuted, cursor: "pointer", fontSize: "14px", padding: "2px 8px", lineHeight: 1 }}>👁</button>
-              
-        <button onClick={onClose} style={{ background: "transparent", border: "none", color: textMuted, cursor: "pointer", fontSize: "16px" }}>✕</button>
+        <div style={{ display: "flex", gap: "6px" }}>
+          <button onClick={onHide} title="Masquer" style={{ background: "transparent", border: `1px solid ${borderC}`, borderRadius: "6px", color: textMuted, cursor: "pointer", fontSize: "14px", padding: "2px 8px" }}>👁</button>
+          <button onClick={onClose} style={{ background: "transparent", border: "none", color: textMuted, cursor: "pointer", fontSize: "16px" }}>✕</button>
+        </div>
       </div>
 
-      <div style={{ padding: "6px 16px 4px", fontSize: "12px", color: done ? "#10b981" : (step.phase === 'selected' ? (darkMode ? "#fcd34d" : "#b45309") : step.phase === 'formulas' ? (darkMode ? "#93c5fd" : "#1d4ed8") : textMuted), fontFamily: "Inter, sans-serif" }}>
-        {step.phase === 'selected' && <span style={{ marginRight: "6px" }}>①</span>}
-        {step.phase === 'formulas' && <span style={{ marginRight: "6px" }}>②</span>}
-        {step.phase === 'committed' && <span style={{ marginRight: "6px" }}>③</span>}
-        {step.message}
-      </div>
+      {/* Hint box */}
+      <HintBox text={step.hint} phase={step.phase} darkMode={darkMode} />
 
-      {/* Graph legend */}
-      <div style={{ padding: "0 16px 8px", display: "flex", gap: "14px", flexWrap: "wrap" }}>
-        {!done ? [
-          ["#1d4ed8","Source (S₀)"],
-          ["#3b82f6","Dans S (sélectionné)"],
-          ["#f59e0b","En cours d'évaluation"],
-        ].map(([col, lab]) => (
-          <div key={lab} style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "10px", color: textMuted }}>
-            <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: col, flexShrink: 0 }} />{lab}
-          </div>
-        )) : [
-          ["#1d4ed8","Source"],
-          ["#f59e0b","Plus courts chemins (arborescence)"],
-        ].map(([col, lab]) => (
-          <div key={lab} style={{ display: "flex", alignItems: "center", gap: "5px", fontSize: "10px", color: textMuted }}>
-            <div style={{ width: "8px", height: "8px", borderRadius: "50%", background: col, flexShrink: 0 }} />{lab}
-          </div>
-        ))}
-      </div>
-
-      <div style={{ overflowX: "auto", padding: "0 12px 4px" }}>
+      {/* Table */}
+      <div style={{ overflowX: "auto", padding: "0 12px 6px", flex: 1 }}>
         <table style={{ borderCollapse: "collapse", fontFamily: mono, fontSize: "12px", tableLayout: "fixed" }}>
           <colgroup>
             <col style={{ width: labelColW }} />
@@ -1036,7 +1023,7 @@ function DijkstraPanel({ elements, startNodeId, onClose, onHide, darkMode, onSte
           </colgroup>
           <thead>
             <tr>
-              <th style={{ padding: "6px 12px", textAlign: "left", color: textMuted, fontSize: "11px", fontWeight: "700", background: thBg, borderBottom: `2px solid ${thBorder}`, borderRight: `1px solid ${thBorder}`, whiteSpace: "nowrap" }}>Sommets sélectionnés</th>
+              <th style={{ padding: "6px 10px", textAlign: "left", color: textMuted, fontSize: "10px", fontWeight: "700", background: thBg, borderBottom: `2px solid ${thBorder}`, borderRight: `1px solid ${thBorder}`, whiteSpace: "nowrap" }}>Sommets sélectionnés</th>
               {ids.map(id => (
                 <th key={id} style={{ padding: "6px 0", textAlign: "center", color: textMain, fontWeight: "700", background: thBg, borderBottom: `2px solid ${thBorder}`, borderLeft: `1px solid ${rowBorder}` }}>
                   {idToLabel[id]}
@@ -1045,87 +1032,54 @@ function DijkstraPanel({ elements, startNodeId, onClose, onHide, darkMode, onSte
             </tr>
           </thead>
           <tbody>
-            {/* Committed rows */}
-            {(() => {
-              // For done state: find the last committed row where each id was NOT yet slashed
-              // That's the row showing its definitive value → circle in gold
-              const definitiveRowIdx = {};
-              if (done) {
-                ids.forEach(id => {
-                  for (let r = committedRows.length - 1; r >= 0; r--) {
-                    const row = committedRows[r];
-                    const isInit = row.selectedId === '__init__';
-                    const inSAtRow = !isInit && row.S.has(id);
-                    if (!inSAtRow) { definitiveRowIdx[id] = r; break; }
-                  }
-                });
-              }
-              return committedRows.map((row, ri) => {
-                const isInit = row.selectedId === '__init__';
-                return (
-                  <tr key={ri} style={{ background: "transparent" }}>
-                    <td style={{ padding: "5px 12px", fontFamily: "Inter, sans-serif", fontSize: "11px", color: isInit ? textMuted : textMain, fontWeight: "400", borderBottom: `1px solid ${rowBorder}`, borderRight: `1px solid ${thBorder}`, whiteSpace: "nowrap" }}>
-                      {isInit ? "Initialisation" : idToLabel[row.selectedId]}
-                    </td>
-                    {ids.map(id => {
-                      const inSAtRow = !isInit && row.S.has(id);
-                      const val = row.lambdaSnap[id];
-                      const isDefinitive = done && definitiveRowIdx[id] === ri;
-                      return (
-                        <td key={id} style={{ padding: "5px 0", textAlign: "center", borderLeft: `1px solid ${rowBorder}`, borderBottom: `1px solid ${rowBorder}` }}>
-                          {inSAtRow ? (
-                            <span style={{ color: textMuted }}>╱</span>
-                          ) : isDefinitive ? (
-                            <span style={{
-                              display: "inline-flex", alignItems: "center", justifyContent: "center",
-                              minWidth: "32px", height: "28px", borderRadius: "4px",
-                              border: `2px solid ${darkMode ? "#f59e0b" : "#b45309"}`,
-                              color: darkMode ? "#fcd34d" : "#b45309",
-                              fontWeight: "700", fontSize: "12px", padding: "0 4px",
-                            }}>
-                              {val === Infinity ? "∞" : val}
-                            </span>
-                          ) : (
-                            <span style={{ color: val === Infinity ? textMuted : textMain }}>
-                              {val === Infinity ? "∞" : val}
-                            </span>
-                          )}
-                        </td>
-                      );
-                    })}
-                  </tr>
-                );
-              });
-            })()}
+            {rows.map((row, ri) => {
+              const isInit = row.selectedId === '__init__';
+              return (
+                <tr key={ri}>
+                  <td style={{ padding: "5px 10px", fontFamily: "Inter, sans-serif", fontSize: "11px", color: isInit ? textMuted : textMain, borderBottom: `1px solid ${rowBorder}`, borderRight: `1px solid ${thBorder}`, whiteSpace: "nowrap" }}>
+                    {isInit ? "Initialisation" : idToLabel[row.selectedId]}
+                  </td>
+                  {ids.map(id => {
+                    const inS = !isInit && row.S.has(id);
+                    const val = row.lambdaSnap[id];
+                    const isGold = done && definitiveRowIdx[id] === ri;
+                    return (
+                      <td key={id} style={{ padding: "5px 0", textAlign: "center", borderLeft: `1px solid ${rowBorder}`, borderBottom: `1px solid ${rowBorder}` }}>
+                        {inS ? (
+                          <span style={{ color: textMuted }}>╱</span>
+                        ) : isGold ? (
+                          <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", minWidth: "30px", height: "26px", borderRadius: "50%", border: `2px solid ${darkMode ? "#f59e0b" : "#b45309"}`, color: darkMode ? "#fcd34d" : "#b45309", fontWeight: "700", fontSize: "12px", padding: "0 3px" }}>
+                            {val === Infinity ? "∞" : val}
+                          </span>
+                        ) : (
+                          <span style={{ color: val === Infinity ? textMuted : textMain }}>{val === Infinity ? "∞" : val}</span>
+                        )}
+                      </td>
+                    );
+                  })}
+                </tr>
+              );
+            })}
 
-            {/* Pending row (formulas) */}
+            {/* Pending row */}
             {pendingRow && (
-              <tr style={{ background: darkMode ? "rgba(59,130,246,0.07)" : "rgba(59,130,246,0.04)" }}>
-                <td style={{ padding: "5px 12px", fontFamily: "Inter, sans-serif", fontSize: "11px", color: "#3b82f6", fontWeight: "700", borderBottom: `1px solid ${rowBorder}`, borderRight: `1px solid ${thBorder}`, whiteSpace: "nowrap" }}>
+              <tr style={{ background: darkMode ? "rgba(245,158,11,0.06)" : "rgba(245,158,11,0.04)" }}>
+                <td style={{ padding: "5px 10px", fontFamily: "Inter, sans-serif", fontSize: "11px", color: darkMode ? "#fcd34d" : "#b45309", fontWeight: "700", borderBottom: `1px solid ${rowBorder}`, borderRight: `1px solid ${thBorder}` }}>
                   {idToLabel[pendingRow.selectedId]}
                 </td>
                 {ids.map(id => {
                   const cell = pendingRow.cells[id];
+                  if (!cell) return <td key={id} style={{ borderLeft: `1px solid ${rowBorder}`, borderBottom: `1px solid ${rowBorder}` }} />;
                   return (
                     <td key={id} style={{ padding: "5px 0", textAlign: "center", borderLeft: `1px solid ${rowBorder}`, borderBottom: `1px solid ${rowBorder}` }}>
                       {cell.slash ? (
                         <span style={{ color: textMuted }}>╱</span>
                       ) : cell.formula ? (
-                        <span style={{
-                          display: "inline-block",
-                          padding: "1px 4px",
-                          borderRadius: "3px",
-                          border: cell.isMin ? "2px solid #ef4444" : "none",
-                          color: cell.isMin ? "#ef4444" : (darkMode ? "#93c5fd" : "#1d4ed8"),
-                          fontWeight: "700",
-                          fontSize: "11px",
-                        }}>
+                        <span style={{ display: "inline-block", padding: "1px 5px", borderRadius: "3px", border: cell.isMin ? "2px solid #ef4444" : `1px solid ${borderC}`, color: cell.isMin ? "#ef4444" : (darkMode ? "#93c5fd" : "#1d4ed8"), fontWeight: "700", fontSize: "11px" }}>
                           {cell.formula}
                         </span>
                       ) : (
-                        <span style={{ color: cell.value === Infinity ? textMuted : textMain }}>
-                          {cell.value === Infinity ? "∞" : cell.value}
-                        </span>
+                        <span style={{ color: cell.value === Infinity ? textMuted : textMain }}>{cell.value === Infinity ? "∞" : cell.value}</span>
                       )}
                     </td>
                   );
@@ -1133,40 +1087,36 @@ function DijkstraPanel({ elements, startNodeId, onClose, onHide, darkMode, onSte
               </tr>
             )}
 
-            {/* STOP row */}
             {done && (
               <tr>
-                <td style={{ padding: "5px 12px", color: "#10b981", fontWeight: "700", fontFamily: "Inter, sans-serif", fontSize: "11px", borderRight: `1px solid ${thBorder}` }}>STOP</td>
+                <td style={{ padding: "5px 10px", color: "#10b981", fontWeight: "700", fontFamily: "Inter, sans-serif", fontSize: "11px", borderRight: `1px solid ${thBorder}` }}>STOP</td>
                 {ids.map(id => <td key={id} style={{ borderLeft: `1px solid ${rowBorder}` }} />)}
               </tr>
             )}
           </tbody>
         </table>
 
-        {/* "min" annotation row under pending */}
-        {pendingRow && (() => {
-          const hasMin = ids.some(id => pendingRow.cells[id]?.isMin);
-          if (!hasMin) return null;
-          return (
-            <div style={{ display: "flex", marginTop: "2px" }}>
-              <div style={{ width: labelColW, flexShrink: 0 }} />
-              {ids.map(id => (
-                <div key={id} style={{ width: dataColW, textAlign: "center", fontSize: "11px", fontWeight: "700", color: "#ef4444", fontFamily: "Inter, sans-serif", flexShrink: 0 }}>
-                  {pendingRow.cells[id]?.isMin ? "min" : ""}
-                </div>
-              ))}
-            </div>
-          );
-        })()}
+        {/* min annotations */}
+        {pendingRow && ids.some(id => pendingRow.cells[id]?.isMin) && (
+          <div style={{ display: "flex", marginTop: "2px" }}>
+            <div style={{ width: labelColW, flexShrink: 0 }} />
+            {ids.map(id => (
+              <div key={id} style={{ width: dataColW, textAlign: "center", fontSize: "10px", fontWeight: "700", color: "#ef4444", fontFamily: "Inter, sans-serif", flexShrink: 0 }}>
+                {pendingRow.cells[id]?.isMin ? "min" : ""}
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
-      <div style={{ padding: "10px 16px 12px", display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: `1px solid ${borderC}` }}>
+      {/* Navigation */}
+      <div style={{ padding: "8px 14px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: `1px solid ${borderC}`, flexShrink: 0 }}>
         <button onClick={() => setIdx(i => Math.max(0, i - 1))} disabled={idx === 0}
           style={{ ...btnBase, background: darkMode ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)", color: idx === 0 ? textMuted : textMain, border: `1px solid ${borderC}`, cursor: idx === 0 ? "default" : "pointer" }}>
           ← Précédent
         </button>
         <span style={{ fontSize: "11px", color: done ? "#10b981" : textMuted, fontWeight: done ? "600" : "400" }}>
-          {done ? "Terminé" : `Étape ${idx + 1} / ${steps.length}`}
+          {done ? "Terminé" : `${idx + 1} / ${steps.length}`}
         </span>
         <button onClick={() => setIdx(i => Math.min(steps.length - 1, i + 1))} disabled={idx === steps.length - 1}
           style={{ ...btnBase, background: idx === steps.length - 1 ? "transparent" : "rgba(59,130,246,0.1)", color: idx === steps.length - 1 ? textMuted : (darkMode ? "#93c5fd" : "#1d4ed8"), border: `1px solid ${idx === steps.length - 1 ? borderC : "rgba(59,130,246,0.4)"}`, cursor: idx === steps.length - 1 ? "default" : "pointer" }}>
@@ -1186,8 +1136,6 @@ function computeFordSteps(elements, startId) {
   nodes.forEach(n => { idToLabel[n.data.id] = n.data.label; });
   const ids = nodes.map(n => n.data.id);
   const n = ids.length;
-
-  // predAdj[j] = list of {src, w} (predecessors of j)
   const predAdj = {};
   ids.forEach(id => { predAdj[id] = []; });
   edges.forEach(e => {
@@ -1197,61 +1145,48 @@ function computeFordSteps(elements, startId) {
 
   let lambda = {};
   ids.forEach(id => { lambda[id] = id === startId ? 0 : Infinity; });
-
-  // Each step: full row of lambda values + per-cell computation details
   const allRows = [{ k: 0, lambda: { ...lambda }, computations: {} }];
   const steps = [];
 
-  // Step 0: init
   steps.push({
-    k: 0, rows: [allRows[0]], done: false,
-    message: 'Initialisation : λ₀(source) = 0, λ₀(autres) = ∞',
-    computationDetail: '',
+    k: 0, rows: [allRows[0]], done: false, stopped: false,
+    hint: `Initialisation : λ(${idToLabel[startId]}) = 0, toutes les autres distances = ∞. À chaque itération k, je calcule pour chaque sommet j : λᵏ(j) = min sur tous les prédécesseurs i de (λᵏ⁻¹(i) + l(i,j)).`,
+    message: `k=0 — Initialisation.`,
   });
 
   let stopped = false;
   for (let k = 1; k <= n && !stopped; k++) {
     const newLambda = { ...lambda };
-    const computations = {}; // j -> { terms: [{src, w, val}], result }
-
+    const computations = {};
     ids.forEach(j => {
-      const terms = predAdj[j]
-        .filter(({ src }) => lambda[src] !== Infinity)
-        .map(({ src, w }) => ({ src, w, val: lambda[src] + w }));
-
+      const terms = predAdj[j].filter(({ src }) => lambda[src] !== Infinity)
+        .map(({ src, w }) => ({ src, w, val: lambda[src] + w, lbl: `λ${k-1}(${idToLabel[src]})+${w}=${lambda[src]+w}` }));
       if (terms.length > 0) {
         const best = Math.min(...terms.map(t => t.val));
         if (best < lambda[j]) newLambda[j] = best;
         computations[j] = { terms, result: newLambda[j] };
       }
     });
-
     const same = ids.every(id => newLambda[id] === lambda[id]);
     lambda = newLambda;
+    allRows.push({ k, lambda: { ...lambda }, computations });
 
-    const row = { k, lambda: { ...lambda }, computations };
-    allRows.push(row);
-
-    // Build detail message for the most interesting computations
-    const changed = ids.filter(j => computations[j] && computations[j].result !== allRows[allRows.length-2].lambda[j]);
-    const detail = changed.slice(0, 3).map(j => {
+    const changed = ids.filter(j => computations[j] && computations[j].result < allRows[allRows.length-2].lambda[j]);
+    const detail = changed.slice(0, 4).map(j => {
       const { terms, result } = computations[j];
-      const termsStr = '[' + terms.map(t => `λ${k-1}(${idToLabel[t.src]})+${t.w}=${t.val}`).join(', ') + ']';
-      return `λ${k}(${idToLabel[j]}) = min${termsStr} = ${result}`;
+      const best = terms.find(t => t.val === result);
+      return `λ(${idToLabel[j]}) = ${best ? best.lbl : result}`;
     }).join(' · ');
 
     steps.push({
-      k, rows: allRows.slice(0, k + 1),
-      done: same || k === n,
-      stopped: same,
-      message: same
-        ? `λ${k} = λ${k-1} — Aucun changement : STOP. Distances optimales trouvées.`
-        : `Itération k=${k} : λᵢ(j) = min_{i∈Γ⁻(j)} (λ${k-1}(i) + l(i,j))`,
-      computationDetail: detail,
+      k, rows: allRows.slice(0, k + 1), done: same || k === n, stopped: same,
+      hint: same
+        ? `λ${k} = λ${k-1} — aucune valeur n'a changé. Cela signifie qu'on a trouvé les plus courts chemins. STOP.`
+        : `k=${k} : pour chaque sommet j, je regarde ses prédécesseurs i et je calcule λ${k-1}(i) + l(i,j). Je garde le minimum.${detail ? ' ' + detail + '.' : ''}`,
+      message: same ? `λ${k} = λ${k-1} → STOP.` : `k=${k} — mise à jour des distances.`,
     });
     if (same) stopped = true;
   }
-
   return { steps, ids, idToLabel };
 }
 
@@ -1277,27 +1212,26 @@ function FordPanel({ elements, startNodeId, onClose, onHide, darkMode, onStep })
   if (steps.length === 0) return (
     <div style={{ position: "fixed", bottom: "20px", left: "50%", transform: "translateX(-50%)", zIndex: 200, background: bg, border: `1px solid ${borderC}`, borderRadius: "14px", padding: "18px 24px", maxWidth: "420px", textAlign: "center" }}>
       <div style={{ color: textMain, fontWeight: "600", marginBottom: "6px" }}>Impossible de lancer Bellman-Ford</div>
-      <div style={{ color: textMuted, fontSize: "12px", marginBottom: "16px" }}>Le graphe doit être orienté pondéré avec un sommet source.</div>
-      <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
-              <button onClick={onHide} title="Masquer le panneau" style={{ background: "transparent", border: `1px solid ${borderC}`, borderRadius: "6px", color: textMuted, cursor: "pointer", fontSize: "13px", padding: "3px 8px", lineHeight: 1 }}>👁</button>
-              <button onClick={onClose} style={{ padding: "7px 20px", background: "#8b5cf6", border: "none", borderRadius: "8px", color: "#fff", cursor: "pointer" }}>Fermer</button>
-            </div>
+      <div style={{ color: textMuted, fontSize: "12px", marginBottom: "16px" }}>Graphe orienté pondéré requis.</div>
+      <button onClick={onClose} style={{ padding: "7px 20px", background: "#8b5cf6", border: "none", borderRadius: "8px", color: "#fff", cursor: "pointer" }}>Fermer</button>
     </div>
   );
 
   const step = steps[idx];
   const done = step.done;
 
-  return (
-    <div style={{ position: "fixed", bottom: "16px", left: "50%", transform: "translateX(-50%)", zIndex: 200, background: bg, border: `1px solid ${borderC}`, borderRadius: "16px", width: "min(900px, 96vw)", maxHeight: "82vh", overflowY: "auto", boxShadow: "0 8px 40px rgba(0,0,0,0.5)", backdropFilter: "blur(12px)" }}>
+  const fPhase = step.k === 0 ? 'init' : step.stopped ? 'done' : 'formulas';
 
-      <div style={{ height: "3px", background: thBorder, borderRadius: "16px 16px 0 0", overflow: "hidden" }}>
+  return (
+    <div style={{ position: "fixed", bottom: "16px", left: "50%", transform: "translateX(-50%)", zIndex: 200, background: bg, border: `1px solid ${borderC}`, borderRadius: "16px", width: "min(940px, 96vw)", maxHeight: "84vh", overflowY: "auto", boxShadow: "0 8px 40px rgba(0,0,0,0.5)", backdropFilter: "blur(12px)", display: "flex", flexDirection: "column" }}>
+
+      <div style={{ height: "3px", background: thBorder, borderRadius: "16px 16px 0 0", overflow: "hidden", flexShrink: 0 }}>
         <div style={{ height: "100%", width: (steps.length > 1 ? idx / (steps.length - 1) * 100 : 0) + "%", background: done ? "#10b981" : "#8b5cf6", transition: "width 0.3s" }} />
       </div>
 
-      <div style={{ padding: "10px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${borderC}` }}>
+      <div style={{ padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", borderBottom: `1px solid ${borderC}`, flexShrink: 0 }}>
         <span style={{ fontWeight: "700", fontSize: "13px", color: textMain, fontFamily: "Inter, sans-serif" }}>
-          Bellman-Ford — k = {step.k} / {steps.length - 1}
+          Bellman-Ford — k = {step.k}
         </span>
         <div style={{ display: "flex", gap: "6px" }}>
           <button onClick={onHide} title="Masquer" style={{ background: "transparent", border: `1px solid ${borderC}`, borderRadius: "6px", color: textMuted, cursor: "pointer", fontSize: "14px", padding: "2px 8px" }}>👁</button>
@@ -1305,21 +1239,17 @@ function FordPanel({ elements, startNodeId, onClose, onHide, darkMode, onStep })
         </div>
       </div>
 
-      <div style={{ padding: "6px 16px", fontSize: "12px", color: done ? "#10b981" : textMuted, fontFamily: "Inter, sans-serif" }}>{step.message}</div>
-      {step.computationDetail && (
-        <div style={{ padding: "2px 16px 8px", fontSize: "11px", color: darkMode ? "#a78bfa" : "#7c3aed", fontFamily: mono, whiteSpace: "pre-wrap" }}>
-          {step.computationDetail}
-        </div>
-      )}
+      {/* Hint box */}
+      <HintBox text={step.hint} phase={fPhase} darkMode={darkMode} />
 
-      <div style={{ overflowX: "auto", padding: "0 12px 12px" }}>
+      <div style={{ overflowX: "auto", padding: "0 12px 6px", flex: 1 }}>
         <table style={{ borderCollapse: "collapse", fontFamily: mono, fontSize: "12px" }}>
           <thead>
             <tr>
-              <th style={{ padding: "6px 10px", textAlign: "center", color: textMuted, fontSize: "11px", fontWeight: "700", background: thBg, borderBottom: `2px solid ${thBorder}`, whiteSpace: "nowrap" }}>k</th>
-              <th style={{ padding: "6px 14px", textAlign: "left", color: textMuted, fontSize: "11px", fontWeight: "700", background: thBg, borderBottom: `2px solid ${thBorder}`, borderLeft: `1px solid ${rowBorder}`, whiteSpace: "nowrap" }}>Sommets</th>
+              <th style={{ padding: "6px 10px", textAlign: "center", color: textMuted, fontSize: "10px", fontWeight: "700", background: thBg, borderBottom: `2px solid ${thBorder}`, whiteSpace: "nowrap" }}>k</th>
+              <th style={{ padding: "6px 12px", textAlign: "left", color: textMuted, fontSize: "10px", fontWeight: "700", background: thBg, borderBottom: `2px solid ${thBorder}`, borderLeft: `1px solid ${rowBorder}` }}>λ</th>
               {ids.map(id => (
-                <th key={id} style={{ padding: "6px 16px", textAlign: "center", color: textMain, fontWeight: "700", background: thBg, borderBottom: `2px solid ${thBorder}`, borderLeft: `1px solid ${rowBorder}`, minWidth: "52px" }}>
+                <th key={id} style={{ padding: "6px 12px", textAlign: "center", color: textMain, fontWeight: "700", background: thBg, borderBottom: `2px solid ${thBorder}`, borderLeft: `1px solid ${rowBorder}`, minWidth: "50px" }}>
                   {idToLabel[id]}
                 </th>
               ))}
@@ -1327,28 +1257,29 @@ function FordPanel({ elements, startNodeId, onClose, onHide, darkMode, onStep })
           </thead>
           <tbody>
             {step.rows.map((row, ri) => {
-              const isCurrentRow = ri === step.rows.length - 1;
-              const prevLambda = ri > 0 ? step.rows[ri - 1].lambda : null;
+              const isCur = ri === step.rows.length - 1;
+              const prevLambda = ri > 0 ? step.rows[ri-1].lambda : null;
               return (
-                <tr key={ri} style={{ background: isCurrentRow ? (darkMode ? "rgba(139,92,246,0.08)" : "rgba(139,92,246,0.04)") : "transparent" }}>
-                  <td style={{ padding: "5px 10px", textAlign: "center", color: isCurrentRow ? "#a78bfa" : textMuted, fontWeight: isCurrentRow ? "700" : "400", borderBottom: `1px solid ${rowBorder}` }}>
-                    {row.k}
-                  </td>
-                  <td style={{ padding: "5px 14px", color: textMuted, fontSize: "10px", fontFamily: "Inter, sans-serif", fontWeight: "600", borderLeft: `1px solid ${rowBorder}`, borderBottom: `1px solid ${rowBorder}`, whiteSpace: "nowrap" }}>
+                <tr key={ri} style={{ background: isCur ? (darkMode ? "rgba(139,92,246,0.08)" : "rgba(139,92,246,0.04)") : "transparent" }}>
+                  <td style={{ padding: "5px 10px", textAlign: "center", color: isCur ? "#a78bfa" : textMuted, fontWeight: isCur ? "700" : "400", borderBottom: `1px solid ${rowBorder}` }}>{row.k}</td>
+                  <td style={{ padding: "5px 12px", color: textMuted, fontSize: "10px", borderLeft: `1px solid ${rowBorder}`, borderBottom: `1px solid ${rowBorder}`, whiteSpace: "nowrap" }}>
                     λ{row.k === 0 ? "₀" : row.k === 1 ? "₁" : row.k === 2 ? "₂" : row.k === 3 ? "₃" : row.k === 4 ? "₄" : row.k === 5 ? "₅" : `(${row.k})`}
                   </td>
                   {ids.map(id => {
                     const val = row.lambda[id];
-                    const changed = isCurrentRow && prevLambda && val !== prevLambda[id];
+                    const changed = isCur && prevLambda && val !== prevLambda[id];
+                    const isStop = isCur && done && step.stopped;
                     return (
-                      <td key={id} style={{ padding: "5px 12px", textAlign: "center", borderLeft: `1px solid ${rowBorder}`, borderBottom: `1px solid ${rowBorder}` }}>
-                        <span style={{
-                          color: changed ? (darkMode ? "#a78bfa" : "#7c3aed") : (val === Infinity ? textMuted : textMain),
-                          fontWeight: changed ? "700" : "400",
-                          fontSize: changed ? "13px" : "12px",
-                        }}>
-                          {val === Infinity ? "∞" : val}
-                        </span>
+                      <td key={id} style={{ padding: "5px 10px", textAlign: "center", borderLeft: `1px solid ${rowBorder}`, borderBottom: `1px solid ${rowBorder}` }}>
+                        {isStop && val !== Infinity ? (
+                          <span style={{ display: "inline-flex", alignItems: "center", justifyContent: "center", minWidth: "28px", height: "24px", borderRadius: "50%", border: `2px solid ${darkMode ? "#f59e0b" : "#b45309"}`, color: darkMode ? "#fcd34d" : "#b45309", fontWeight: "700", fontSize: "12px" }}>
+                            {val}
+                          </span>
+                        ) : (
+                          <span style={{ color: changed ? (darkMode ? "#a78bfa" : "#7c3aed") : val === Infinity ? textMuted : textMain, fontWeight: changed ? "700" : "400" }}>
+                            {val === Infinity ? "∞" : val}
+                          </span>
+                        )}
                       </td>
                     );
                   })}
@@ -1357,7 +1288,7 @@ function FordPanel({ elements, startNodeId, onClose, onHide, darkMode, onStep })
             })}
             {done && step.stopped && (
               <tr>
-                <td colSpan={2} style={{ padding: "5px 14px", color: "#10b981", fontWeight: "700", fontFamily: "Inter, sans-serif", fontSize: "11px", borderRight: `1px solid ${thBorder}` }}>STOP</td>
+                <td colSpan={2} style={{ padding: "5px 12px", color: "#10b981", fontWeight: "700", fontFamily: "Inter, sans-serif", fontSize: "11px", borderRight: `1px solid ${thBorder}` }}>STOP</td>
                 {ids.map(id => <td key={id} style={{ borderLeft: `1px solid ${rowBorder}` }} />)}
               </tr>
             )}
@@ -1365,13 +1296,13 @@ function FordPanel({ elements, startNodeId, onClose, onHide, darkMode, onStep })
         </table>
       </div>
 
-      <div style={{ padding: "8px 16px 12px", display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: `1px solid ${borderC}` }}>
+      <div style={{ padding: "8px 14px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", borderTop: `1px solid ${borderC}`, flexShrink: 0 }}>
         <button onClick={() => setIdx(i => Math.max(0, i - 1))} disabled={idx === 0}
           style={{ ...btnBase, background: darkMode ? "rgba(255,255,255,0.05)" : "rgba(0,0,0,0.04)", color: idx === 0 ? textMuted : textMain, border: `1px solid ${borderC}`, cursor: idx === 0 ? "default" : "pointer" }}>
           ← Précédent
         </button>
         <span style={{ fontSize: "11px", color: done ? "#10b981" : textMuted, fontWeight: done ? "600" : "400" }}>
-          {done ? (step.stopped ? "STOP — convergé" : "Maximum atteint") : `k = ${step.k}`}
+          {done ? (step.stopped ? "STOP — convergé" : "Max atteint") : `k = ${step.k}`}
         </span>
         <button onClick={() => setIdx(i => Math.min(steps.length - 1, i + 1))} disabled={idx === steps.length - 1}
           style={{ ...btnBase, background: idx === steps.length - 1 ? "transparent" : "rgba(139,92,246,0.1)", color: idx === steps.length - 1 ? textMuted : "#a78bfa", border: `1px solid ${idx === steps.length - 1 ? borderC : "rgba(139,92,246,0.4)"}`, cursor: idx === steps.length - 1 ? "default" : "pointer" }}>
@@ -1381,6 +1312,7 @@ function FordPanel({ elements, startNodeId, onClose, onHide, darkMode, onStep })
     </div>
   );
 }
+
 
 function PrimPanel({ elements, startNodeId, onClose, onHide, onStep, darkMode }) {
   const [idx, setIdx] = useState(0);
@@ -3813,11 +3745,40 @@ const TEMPLATES = [
       { s: "G", t: "H" },
     ],
   },
-  // ── PONDÉRÉS ACM ────────────────────────────────────────────────────────────
+  {
+  id: "parcours_cours",
+  name: "Parcours",
+  description: "9 sommets, idéal pour suivre l'exectuion de l'algorithme de parcours en largeur ou en profendeur.",
+  category: "Non-pondéré",
+  directed: true,
+  nodes: [
+    { id: "0", label: "0", x: 250, y: 100 },
+    { id: "1", label: "1", x: 450, y: 100 },
+    { id: "2", label: "2", x: 100, y: 200 },
+    { id: "3", label: "3", x: 300, y: 250 },
+    { id: "4", label: "4", x: 500, y: 250 },
+    { id: "5", label: "5", x: 650, y: 250 },
+    { id: "6", label: "6", x: 300, y: 400 },
+    { id: "7", label: "7", x: 500, y: 400 },
+    { id: "8", label: "8", x: 650, y: 400 },
+  ],
+  edges: [
+    { s: "0", t: "1" },
+    { s: "1", t: "4" }, { s: "1", t: "5" },
+    { s: "2", t: "0" }, { s: "2", t: "3" },
+    { s: "3", t: "1" }, { s: "3", t: "7" },
+    { s: "4", t: "0" },
+    { s: "5", t: "7" },
+    { s: "6", t: "3" },
+    { s: "7", t: "5" }, { s: "7", t: "6" }, { s: "7", t: "8" },
+    { s: "8", t: "5" },
+  ],
+},
+  // ── PONDÉRÉS   ────────────────────────────────────────────────────────────
   {
     id: "kruskal_cours",
     name: "ACM — Kruskal",
-    description: "7 sommets A-G, classique pour Kruskal/Prim",
+    description: "7 sommets A-G, idéal pour suivre l'execution de l'algorithme de Kruskal",
     category: "Pondéré",
     directed: false,
     nodes: [
@@ -3839,7 +3800,7 @@ const TEMPLATES = [
   {
     id: "prim_cours",
     name: "ACM — Prim",
-    description: "10 sommets, idéal pour l'algorithme de Prim",
+    description: "10 sommets, idéal pour suivre l'execution de l'algorithme de Prim",
     category: "Pondéré",
     directed: false,
     nodes: [
@@ -3864,6 +3825,61 @@ const TEMPLATES = [
       { s: "6",  t: "5",  w: 9  }, { s: "10", t: "4",  w: 18 },
     ],
   },
+  {
+  id: "bellman_ford_test",
+  name: "Plus Courts Chemins — Bellman-Ford",
+  description: "7 sommets avec poids négatifs, idéal pour suivre l'execution de l'algorithme de Bellman Ford.",
+  category: "Pondéré",
+  directed: true,
+  nodes: [
+    { id: "1", label: "1", x: 50,  y: 250 },
+    { id: "2", label: "2", x: 200, y: 100 },
+    { id: "3", label: "3", x: 350, y: 100 },
+    { id: "4", label: "4", x: 500, y: 100 },
+    { id: "5", label: "5", x: 500, y: 300 },
+    { id: "6", label: "6", x: 350, y: 300 },
+    { id: "7", label: "7", x: 200, y: 300 },
+  ],
+  edges: [
+    { s: "1", t: "2", w: 2  },
+    { s: "1", t: "7", w: 4  },
+    { s: "2", t: "3", w: 1  },
+    { s: "2", t: "6", w: 2  },
+    { s: "3", t: "4", w: 2  },
+    { s: "3", t: "5", w: 1  },
+    { s: "3", t: "6", w: -2 },
+    { s: "4", t: "5", w: -2 },
+    { s: "6", t: "5", w: 5  },
+    { s: "6", t: "7", w: 1  },
+    { s: "7", t: "2", w: 1  },
+  ],
+},{
+  id: "dijkstra_cours",
+  name: "Plus Courts Chemins — Dijkstra",
+  description: "6 sommets, idéal pour suivre l'exécution de l'algorithme de Dijkstra.",
+  category: "Pondéré",
+  directed: true,
+  nodes: [
+    { id: "1", label: "1", x: 300, y: 100 },
+    { id: "2", label: "2", x: 500, y: 100 },
+    { id: "3", label: "3", x: 100, y: 300 },
+    { id: "4", label: "4", x: 700, y: 300 },
+    { id: "5", label: "5", x: 300, y: 500 },
+    { id: "6", label: "6", x: 550, y: 500 },
+  ],
+  edges: [
+    { s: "1", t: "2", w: 4 },
+    { s: "1", t: "6", w: 1 },
+    { s: "3", t: "1", w: 7 },
+    { s: "3", t: "5", w: 1 },
+    { s: "4", t: "1", w: 2 },
+    { s: "4", t: "2", w: 5 },
+    { s: "5", t: "1", w: 5 },
+    { s: "5", t: "4", w: 2 },
+    { s: "5", t: "6", w: 7 },
+    { s: "6", t: "4", w: 3 },
+  ],
+},
   {
     id: "petersen_pondere",
     name: "Graphe de Petersen",
@@ -4948,28 +4964,11 @@ export default function GraphVisualizer() {
       cy.nodes().removeClass("dijkstra-selected dijkstra-source dijkstra-pending dijkstra-path");
       cy.edges().removeClass("dijkstra-tree dijkstra-highlight dijkstra-path");
 
-      const { cyNodes, cyEdges } = dijkstraStep.cy;
-      const classMap = {
-        source: "dijkstra-source",
-        selected: "dijkstra-selected",
-        pending: "dijkstra-pending",
-        path: "dijkstra-path",
-      };
-      const edgeClassMap = {
-        tree: "dijkstra-tree",
-        highlight: "dijkstra-highlight",
-        path: "dijkstra-path",
-      };
-
-      Object.entries(cyNodes || {}).forEach(([id, cls]) => {
-        if (!cls) return;
-        try { const el = cy.getElementById(id); if (el.length) el.addClass(classMap[cls]); } catch(e) {}
-      });
-
-      Object.entries(cyEdges || {}).forEach(([eid, cls]) => {
-        if (!cls) return;
-        try { const el = cy.getElementById(eid); if (el.length) el.addClass(edgeClassMap[cls]); } catch(e) {}
-      });
+      const { cyN, cyE } = dijkstraStep.cy;
+      const nCls = { source:"dijkstra-source", selected:"dijkstra-selected", pending:"dijkstra-pending", path:"dijkstra-path" };
+      const eCls = { tree:"dijkstra-tree", highlight:"dijkstra-highlight", path:"dijkstra-path" };
+      Object.entries(cyN||{}).forEach(([id,cls])=>{ if(!cls)return; try{const el=cy.getElementById(id);if(el.length)el.addClass(nCls[cls]);}catch(e){} });
+      Object.entries(cyE||{}).forEach(([eid,cls])=>{ if(!cls)return; try{const el=cy.getElementById(eid);if(el.length)el.addClass(eCls[cls]);}catch(e){} });
 
     } catch(err) { console.error("Dijkstra cy:", err); }
   }, [dijkstraStep, showDijkstra]);
